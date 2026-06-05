@@ -25,7 +25,9 @@ options:
   color_default: "#0078FF"
   pulse_speed: 1.5
   route_colors:
+    - route: "1"
       color: "#FF1493"
+    - route: "2"
       color: "#FFA000"
   # WLED instances — add one entry per physical WLED device
   # label becomes the HA entity name and MQTT topic slug
