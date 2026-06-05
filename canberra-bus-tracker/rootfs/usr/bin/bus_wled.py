@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Canberra Bus Tracker v0.3.15
+Canberra Bus Tracker v0.3.16
 Tracks buses approaching a stop from both directions using GTFS static +
 realtime feeds, with GPS dead-reckoning, route colours, continuous
 position-based LED fading across physical LED groups, departed timeout,
@@ -53,19 +53,60 @@ GTFS_STATIC_URL        = "https://www.transport.act.gov.au/googletransit/google_
 EARTH_RADIUS_M         = 6_371_000
 COASTING_STALE_TIMEOUT = 120
 
+# Average inter-stop travel time used to convert arrival_offset_seconds → stop count.
+# Adjust if Canberra buses are consistently faster or slower between stops.
+SECS_PER_STOP = 60
+
 MODE_RUNNING  = "running"
 MODE_COASTING = "coasting"
 MODE_OFF      = "off"
 
-NUM_VIRTUAL   = 5   # always 5 virtual states
-STATE_PRIORITY = ["at_stop", "1_stop", "departed", "2_stops", "3_stops", "gone"]
+NUM_VIRTUAL    = 5   # always 5 virtual states
+STATE_PRIORITY = ["at_stop", "1_stop", "2_stops", "3_stops", "departed", "gone"]
 
 # Virtual state indices (Direction A order: 3-stops → departed)
-V_3STOPS  = 0
-V_2STOPS  = 1
-V_1STOP   = 2
-V_ATSTOP  = 3
+V_3STOPS   = 0
+V_2STOPS   = 1
+V_1STOP    = 2
+V_ATSTOP   = 3
 V_DEPARTED = 4
+
+# Maximum HTTP sends per second to WLED (prevents saturation during pulse)
+WLED_MAX_HZ = 5
+WLED_MIN_INTERVAL = 1.0 / WLED_MAX_HZ
+
+
+# ── Colour helpers ─────────────────────────────────────────────────────────────
+def parse_color(value) -> list:
+    """
+    Accept colour in any of these forms and return [R, G, B] int list:
+      - [R, G, B]           already a list (pass-through)
+      - "#RRGGBB"           hex string with hash
+      - "RRGGBB"            hex string without hash
+      - "#RGB"              short hex
+      - 0xRRGGBB            integer
+    All channel values are clamped to 0-255.
+    """
+    if isinstance(value, (list, tuple)):
+        if len(value) != 3:
+            raise ValueError(f"Color list must have 3 elements, got {len(value)}: {value}")
+        return [max(0, min(255, int(v))) for v in value]
+    if isinstance(value, int):
+        r = (value >> 16) & 0xFF
+        g = (value >>  8) & 0xFF
+        b =  value        & 0xFF
+        return [r, g, b]
+    if isinstance(value, str):
+        s = value.strip().lstrip("#")
+        if len(s) == 3:
+            s = s[0]*2 + s[1]*2 + s[2]*2
+        if len(s) != 6:
+            raise ValueError(f"Cannot parse colour string: {value!r}")
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+        return [r, g, b]
+    raise ValueError(f"Unsupported colour type {type(value)}: {value!r}")
 
 
 # ── Group layout ──────────────────────────────────────────────────────────────
@@ -77,9 +118,9 @@ def calculate_groups(num_leds: int) -> list[tuple[int, int]]:
     priority order for extras is V_ATSTOP, V_1STOP, V_2STOPS, V_3STOPS, V_DEPARTED.
     For a 12-LED strip: base=2, extras=2 → groups [2,2,3,3,2]
     """
-    base    = num_leds // NUM_VIRTUAL
-    extras  = num_leds % NUM_VIRTUAL
-    sizes   = [base] * NUM_VIRTUAL
+    base   = num_leds // NUM_VIRTUAL
+    extras = num_leds % NUM_VIRTUAL
+    sizes  = [base] * NUM_VIRTUAL
 
     # Centre-weighted extra distribution
     extra_order = [V_ATSTOP, V_1STOP, V_2STOPS, V_3STOPS, V_DEPARTED]
@@ -103,9 +144,6 @@ def groups_for_direction(groups: list, direction: str) -> list[tuple[int, int]]:
     Direction A: natural order — index 0 = leftmost group (3-stops)
     Direction B: reversed     — index 0 maps to rightmost group (also 3-stops
                                 for Dir B, which physically sits at the right end)
-
-    After reversing, dir_groups[V_3STOPS] correctly gives the physical group
-    for "3 stops away" in Direction B, and so on for all states.
     """
     if direction == "A":
         return groups
@@ -119,16 +157,8 @@ def bus_strip_fraction(stops_away: int, seg_fraction: float) -> float:
     Map a bus's current position to a 0.0–1.0 fraction along the strip.
     0.0 = start of 3-stops group (furthest away)
     1.0 = end of departed group
-
-    For discrete stops (2-stops, 3-stops): position is the centre of that group.
-    For 1-stop: interpolate between centre of 1-stop group and centre of at-stop group
-                using seg_fraction (GPS-derived 0.0-1.0).
-    For at-stop: centre of at-stop group (pulses separately).
-    For departed: centre of departed group.
     """
-    # Equally-spaced centres regardless of physical group sizes
     centres = [i / (NUM_VIRTUAL - 1) for i in range(NUM_VIRTUAL)]
-    # centres[0]=0.0 (3-stops) … centres[4]=1.0 (departed)
 
     if stops_away is None:
         return 0.0
@@ -160,6 +190,7 @@ class WledInstance:
         self._brightness    = max(0, min(100, brightness_pct))
         self._lock          = threading.Lock()
         self.groups         = calculate_groups(self.num_leds)
+        self._last_send     = 0.0   # timestamp of last successful HTTP send
         log.info("WLED [%s]: %d LEDs, segment %d, groups: %s",
                  label, self.num_leds, segment_id,
                  [(g[1] - g[0]) for g in self.groups])
@@ -194,16 +225,15 @@ class WledInstance:
             state    = resp.json()
             segments = state.get("seg", [])
 
-            # Check if our segment ID already exists
             existing_ids = {s.get("id") for s in segments if isinstance(s, dict)}
             if self.segment_id in existing_ids:
                 log.info("WLED [%s]: segment %d already exists — leaving unchanged",
                          self.label, self.segment_id)
-                # Clear it on startup so it doesn't show stale colours
+                # Only clear on startup if segment already existed — avoids flash
+                # on first-ever run when segment has never been configured
                 self.clear()
                 return
 
-            # Create the segment
             log.info("WLED [%s]: creating segment %d (LEDs %d–%d)",
                      self.label, self.segment_id,
                      self.led_offset, self.led_offset + self.num_leds - 1)
@@ -212,14 +242,13 @@ class WledInstance:
                 json={"seg": [{
                     "id":    self.segment_id,
                     "start": self.led_offset,
-                    "stop":  self.led_offset + self.num_leds,  # stop is exclusive in WLED
+                    "stop":  self.led_offset + self.num_leds,
                     "on":    True,
                     "bri":   self.brightness_255,
                 }]},
                 timeout=5,
             )
             log.info("WLED [%s]: segment %d created", self.label, self.segment_id)
-            # Clear immediately so it doesn't show default WLED effect colour
             self.clear()
 
         except requests.RequestException as e:
@@ -227,7 +256,6 @@ class WledInstance:
                         self.label, e)
 
     def _seg_payload(self, i_data: list) -> dict:
-        """Build a JSON payload targeting our segment by ID with segment-level brightness."""
         return {
             "seg": [{
                 "id":  self.segment_id,
@@ -236,12 +264,17 @@ class WledInstance:
             }]
         }
 
-    def send(self, leds: list):
-        """Send LED colour data to our segment."""
+    def send(self, leds: list, force: bool = False):
+        """
+        Send LED colour data to our segment.
+        Throttled to WLED_MAX_HZ to avoid saturating WLED with HTTP.
+        Pass force=True to bypass throttle (e.g. clear on shutdown).
+        """
         if not self.ip:
             return
-        # Individual LED addressing within the segment uses local indices (0-based from
-        # segment start), not global strip indices — the segment handles the offset.
+        now = time.time()
+        if not force and (now - self._last_send) < WLED_MIN_INTERVAL:
+            return
         i_data = [0]   # start at position 0 within the segment
         for led in leds:
             i_data.extend([max(0, min(255, v)) for v in led])
@@ -251,11 +284,12 @@ class WledInstance:
                 json=self._seg_payload(i_data),
                 timeout=3,
             )
+            self._last_send = now
         except requests.RequestException as e:
             log.warning("WLED [%s]: %s", self.label, e)
 
     def clear(self):
-        """Turn off all LEDs in our segment."""
+        """Turn off all LEDs in our segment (bypasses rate throttle)."""
         if not self.ip:
             return
         i_data = [0] + [0] * (self.num_leds * 3)
@@ -265,6 +299,7 @@ class WledInstance:
                 json=self._seg_payload(i_data),
                 timeout=3,
             )
+            self._last_send = time.time()
         except requests.RequestException as e:
             log.warning("WLED [%s] clear: %s", self.label, e)
 
@@ -297,13 +332,32 @@ def load_config() -> dict:
         ))
 
     # route_colors can be either:
-    # - list format (from HA config UI): [{"route": "5", "color": "#FF1493"}, ...]
-    # - dict format (from options.json or standalone): {"5": "#FF1493", ...}
+    # - list format (from HA config UI): [{"route": "5", "color": [255,20,147]}, ...]
+    # - dict format (from options.json or standalone): {"5": [255,20,147], ...}
     raw_colors = cfg.get("route_colors", [])
     if isinstance(raw_colors, list):
-        route_colors = {item["route"]: hex_to_rgb(item["color"]) for item in raw_colors if "route" in item}
+        route_colors = {}
+        for item in raw_colors:
+            if "route" in item:
+                try:
+                    route_colors[item["route"]] = parse_color(item["color"])
+                except (ValueError, TypeError) as e:
+                    log.warning("Bad route color for route %s: %s", item.get("route"), e)
     else:
-        route_colors = {k: hex_to_rgb(v) for k, v in raw_colors.items()}
+        route_colors = {}
+        for route, color in raw_colors.items():
+            try:
+                route_colors[route] = parse_color(color)
+            except (ValueError, TypeError) as e:
+                log.warning("Bad route color for route %s: %s", route, e)
+
+    def safe_color(key, default):
+        raw = cfg.get(key, default)
+        try:
+            return parse_color(raw)
+        except (ValueError, TypeError) as e:
+            log.warning("Bad color for %s (%r): %s — using default %s", key, raw, e, default)
+            return list(default)
 
     return {
         "api_key":                  get("api_key", "Transport Canberra API key", secret=True),
@@ -319,11 +373,11 @@ def load_config() -> dict:
         "departed_timeout_seconds": int(cfg.get("departed_timeout_seconds", 60)),
         "wled_instances":           wled_instances,
         "flash_interval_ms":        int(cfg.get("flash_interval_ms", 500)),
-        "color_at_stop":            hex_to_rgb(cfg.get("color_at_stop",  "#FFFFFF")),
-        "color_departed":           hex_to_rgb(cfg.get("color_departed", "#FF0000")),
-        "color_off":                hex_to_rgb(cfg.get("color_off",      "#000000")),
+        "color_at_stop":            safe_color("color_at_stop",  [255, 255, 255]),
+        "color_departed":           safe_color("color_departed", [255,   0,   0]),
+        "color_off":                safe_color("color_off",      [  0,   0,   0]),
+        "color_default":            safe_color("color_default",  [  0, 120, 255]),
         "route_colors":             route_colors,
-        "color_default":            hex_to_rgb(cfg.get("color_default",  "#0078FF")),
         "pulse_speed":              float(cfg.get("pulse_speed", 1.5)),
         "mqtt_enabled":             bool(cfg.get("mqtt_enabled", False)),
         "mqtt_host":                cfg.get("mqtt_host", "core-mosquitto"),
@@ -359,24 +413,6 @@ def segment_fraction(bus_lat, bus_lon, from_lat, from_lon, to_lat, to_lon) -> fl
     return max(0.0, min(1.0, (bx * dx + by * dy) / seg_len_sq))
 
 
-def hex_to_rgb(value) -> list:
-    """
-    Convert a colour value to [R, G, B].
-    Accepts:
-      - Hex string: "#FF1493" or "FF1493" (with or without #)
-      - RGB list:   [255, 20, 147]  (legacy/standalone format)
-    Falls back to white [255,255,255] on any parse error.
-    """
-    if isinstance(value, (list, tuple)):
-        return [max(0, min(255, int(v))) for v in value[:3]]
-    try:
-        h = str(value).strip().lstrip("#")
-        return [int(h[i:i+2], 16) for i in (0, 2, 4)]
-    except Exception:
-        log.warning("Invalid colour value '%s' — using white", value)
-        return [255, 255, 255]
-
-
 # ── GTFS Static ───────────────────────────────────────────────────────────────
 class GtfsStatic:
     def __init__(self, url, cache_path, refresh_hours):
@@ -391,13 +427,11 @@ class GtfsStatic:
         self._lock         = threading.Lock()
 
     def ensure_loaded(self):
-        # Quick age check outside the lock to avoid lock contention on every loop tick
         if self.loaded_at:
             age_h = (datetime.now() - self.loaded_at).total_seconds() / 3600
             if age_h < self.refresh_hours:
                 return
         with self._lock:
-            # Re-check inside lock in case another thread just loaded it
             if self.loaded_at:
                 age_h = (datetime.now() - self.loaded_at).total_seconds() / 3600
                 if age_h < self.refresh_hours:
@@ -459,22 +493,42 @@ class GtfsStatic:
         self.stop_coords = stop_coords; self.stop_trips = stop_trips
 
     def stops_away(self, trip_id, stop_id, remaining_stop_ids) -> int | None:
+        """
+        Returns how many stops the bus is away from stop_id:
+          0  = at the stop (stop_id is the very next stop)
+         >0  = N stops away
+         -1  = has passed the stop (departed)
+         None = this trip doesn't serve stop_id
+
+        Uses the GTFS static sequence as ground truth for stop ordering,
+        then finds where the first remaining stop sits relative to the target.
+        Falls back to scanning remaining_stop_ids directly if the next
+        remaining stop isn't found in the static sequence (data gap).
+        """
         seq = self.trip_stops.get(trip_id)
         if not seq or stop_id not in seq:
             return None
+
         target_idx = seq.index(stop_id)
+
         if not remaining_stop_ids:
-            return None
-        next_stop = remaining_stop_ids[0]
-        if next_stop not in seq:
-            for i, sid in enumerate(remaining_stop_ids):
-                if sid == stop_id:
-                    return i
-            return None
-        next_idx = seq.index(next_stop)
-        if next_idx > target_idx:
+            # No remaining stops in the feed at all — bus has passed everything
             return -1
-        return target_idx - next_idx
+
+        # Walk remaining stops to find the first one that appears in our static sequence
+        for i, sid in enumerate(remaining_stop_ids):
+            if sid not in seq:
+                continue  # skip stops not in static (data inconsistency)
+            next_idx = seq.index(sid)
+            if next_idx > target_idx:
+                # Bus has already passed the target stop
+                return -1
+            # Bus is i stops before the first known remaining stop,
+            # which is (target_idx - next_idx) stops from the target
+            return target_idx - next_idx + i
+
+        # All remaining stops either not in static or after target — treat as departed
+        return -1
 
     def segment_coords(self, trip_id, stop_id) -> tuple | None:
         seq = self.trip_stops.get(trip_id)
@@ -495,13 +549,14 @@ class GtfsStatic:
 
 # ── Bus state ─────────────────────────────────────────────────────────────────
 class BusState:
-    def __init__(self, trip_id, route_id, direction, headsign, color, stop_id):
+    def __init__(self, trip_id, route_id, direction, direction_id, headsign, color, stop_id):
         self.trip_id        = trip_id
         self.route_id       = route_id
         self.direction      = direction
+        self.direction_id   = direction_id   # GTFS direction_id from trips.txt
         self.headsign       = headsign
         self.color          = color
-        self.stop_id        = stop_id   # the specific stop this bus is heading toward
+        self.stop_id        = stop_id
         self.stops_away     = None
         self.raw_stops_away = None
         self.gps_lat        = None
@@ -533,6 +588,8 @@ class BusState:
     def extrapolated_seg_fraction(self, seg_from, seg_to) -> float:
         if self.gps_lat is None:
             return self.seg_fraction
+        # Use a fresh timestamp so dead-reckoning doesn't underestimate
+        # due to the stale `now` captured at the top of the main loop
         now  = time.time()
         dt   = now - (self.gps_time or now)
         frac = segment_fraction(
@@ -577,15 +634,6 @@ class BusState:
 class LedRenderer:
     """
     Renders active buses onto a physical LED strip of arbitrary length.
-
-    Each virtual state maps to a group of physical LEDs.
-    Bus position is expressed as a 0.0-1.0 strip fraction and rendered
-    as a moving point of light that smoothly fades between adjacent LEDs.
-
-    Special cases:
-    - at_stop: entire at-stop group pulses in route colour
-    - departed: entire departed group solid red
-    - Two buses at same strip position: flash between their colours
     """
 
     def __init__(self, cfg, gtfs):
@@ -603,16 +651,10 @@ class LedRenderer:
 
     def render_for_instance(self, inst: WledInstance, active_buses: list,
                             pulse_brightness: float) -> list:
-        """
-        Render all active buses onto inst's physical LED strip.
-        Returns list of num_leds [R,G,B] values.
-        """
         num_leds = inst.num_leds
         groups   = inst.groups
         leds     = [list(self.cfg["color_off"]) for _ in range(num_leds)]
 
-        # Collect contributions per physical LED index:
-        # led_contributions[idx] = [(color, weight, bus), ...]
         led_contributions = {}
 
         for bus in active_buses:
@@ -620,10 +662,8 @@ class LedRenderer:
                 continue
 
             dir_groups = groups_for_direction(groups, bus.direction)
-            # dir_groups[V_3STOPS..V_DEPARTED] = (start, end) for this direction
 
             if bus.state == "departed":
-                # Light entire departed group solid red
                 start, end = dir_groups[V_DEPARTED]
                 for i in range(start, end):
                     led_contributions.setdefault(i, []).append(
@@ -632,7 +672,6 @@ class LedRenderer:
                 continue
 
             if bus.state == "at_stop":
-                # Light entire at-stop group, pulsing in route colour
                 start, end = dir_groups[V_ATSTOP]
                 color = [int(c * pulse_brightness) for c in bus.color]
                 for i in range(start, end):
@@ -641,7 +680,6 @@ class LedRenderer:
                     )
                 continue
 
-            # Approaching buses: calculate strip fraction and render as moving point
             seg_frac = 0.0
             if bus.state == "1_stop":
                 seg = self.gtfs.segment_coords(bus.trip_id, bus.stop_id)
@@ -650,15 +688,8 @@ class LedRenderer:
                     bus.seg_fraction = seg_frac
 
             strip_frac = bus_strip_fraction(bus.stops_away, seg_frac)
+            phys_pos   = strip_frac * (num_leds - 1)
 
-            # Map strip fraction to physical LED position for this direction
-            # strip_frac 0.0 = start of first group, 1.0 = end of last group
-            # For Direction B the groups are reversed so the fraction naturally
-            # increases in the correct direction of travel
-            phys_pos = strip_frac * (num_leds - 1)  # 0.0 to num_leds-1
-
-            # Determine colour at this position
-            # On the 1-stop→at-stop transition, fade route colour → white
             if bus.state == "1_stop":
                 route = bus.color
                 white = self.cfg["color_at_stop"]
@@ -667,10 +698,9 @@ class LedRenderer:
             else:
                 color = list(bus.color)
 
-            # Spread light across the two adjacent LEDs
             lo  = int(phys_pos)
             hi  = min(lo + 1, num_leds - 1)
-            t   = phys_pos - lo   # fractional part: weight toward hi
+            t   = phys_pos - lo
             w_lo = 1.0 - t
             w_hi = t
 
@@ -679,7 +709,6 @@ class LedRenderer:
             if w_hi > 0.01 and hi != lo:
                 led_contributions.setdefault(hi, []).append((color, w_hi, bus))
 
-        # Resolve contributions into final LED colours
         for idx, contributions in led_contributions.items():
             if not contributions:
                 continue
@@ -688,18 +717,14 @@ class LedRenderer:
                 color, weight, _ = contributions[0]
                 leds[idx] = [int(c * weight) for c in color]
             else:
-                # Multiple buses contributing to this LED
-                # Group by bus to detect conflicts
                 by_bus = {}
                 for color, weight, bus in contributions:
                     tid = bus.trip_id
                     if tid not in by_bus:
                         by_bus[tid] = (color, weight, bus)
                     else:
-                        # Same bus contributing from two adjacent positions — add weights
                         ec, ew, eb = by_bus[tid]
                         combined_w = ew + weight
-                        # Blend colours proportionally
                         blended = [
                             int((ec[i] * ew + color[i] * weight) / combined_w)
                             for i in range(3)
@@ -711,7 +736,6 @@ class LedRenderer:
                     color, weight, _ = unique_buses[0]
                     leds[idx] = [int(c * weight) for c in color]
                 else:
-                    # Multiple different buses — flash between the two highest priority
                     unique_buses.sort(key=lambda x: x[2].priority())
                     chosen = unique_buses[0] if self.flash_state else unique_buses[1]
                     color, weight, _ = chosen
@@ -787,7 +811,7 @@ class MqttPublisher:
             "identifiers":  ["canberra_bus_tracker"],
             "name":         "Canberra Bus Tracker",
             "manufacturer": "Custom",
-            "model":        "canberra_bus_tracker v0.3.15",
+            "model":        "canberra_bus_tracker v0.3.16",
         }
         for uid, name in (
             ("direction_a", "Direction A Bus"),
@@ -877,16 +901,21 @@ def main():
     cfg       = load_config()
     set_log_level(cfg["debug"])
     instances = cfg["wled_instances"]
-    log.info("Canberra Bus Tracker v0.3.15 starting")
+    log.info("Canberra Bus Tracker v0.3.16 starting")
     log.info("  Stop A: %s | Stop B: %s | WLED instances: %d",
              cfg["stop_id_a"], cfg["stop_id_b"], len(instances))
 
     route_filter = [r.strip() for r in cfg["route_filter"].split(",") if r.strip()]
-    offset_stops = max(0, round(cfg["arrival_offset_seconds"] / 30))
-    gtfs         = GtfsStatic(cfg["gtfs_static_url"], GTFS_CACHE, cfg["gtfs_refresh_hours"])
+
+    # Convert arrival_offset_seconds to a stop count using a realistic per-stop
+    # travel time (SECS_PER_STOP). A 90s offset at 60s/stop = 1 stop offset,
+    # meaning a bus 2 raw stops away is displayed as 1 stop away.
+    offset_stops = max(0, round(cfg["arrival_offset_seconds"] / SECS_PER_STOP))
+    log.info("  Arrival offset: %ds → %d stop(s)", cfg["arrival_offset_seconds"], offset_stops)
+
+    gtfs = GtfsStatic(cfg["gtfs_static_url"], GTFS_CACHE, cfg["gtfs_refresh_hours"])
     gtfs.ensure_loaded()
 
-    # Ensure each WLED instance has its segment defined
     for inst in instances:
         inst.ensure_segment()
 
@@ -902,7 +931,7 @@ def main():
             mode = new_mode
 
     def handle_command(cmd):
-        if cmd == "ON":   set_mode(MODE_RUNNING)
+        if cmd == "ON":    set_mode(MODE_RUNNING)
         elif cmd == "OFF": set_mode(MODE_COASTING)
 
     def handle_brightness(label_slug, pct):
@@ -925,17 +954,18 @@ def main():
     trip_url    = f"{api_url}/trip-updates.pb"
     vehicle_url = f"{api_url}/vehicle-positions.pb"
 
-    # Use a session for connection reuse and consistent TLS handling
+    # Mount adapter on both http and https so dev/test http URLs also benefit
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter()
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     active_buses: dict[str, BusState] = {}
     coasting_ids: set[str]            = set()
 
-    # Track last rendered LEDs per instance for change detection
     prev_leds   = {inst.label_slug: None for inst in instances}
     pulse_phase = 0.0
+    last_pulse_time = time.time()
     last_trip   = 0.0
     last_gps    = 0.0
     last_mqtt   = 0.0
@@ -957,6 +987,11 @@ def main():
         return feed
 
     def best_per_direction() -> dict:
+        """
+        Return the highest-priority (most actionable) bus per direction.
+        Priority order: at_stop > 1_stop > 2_stops > 3_stops > departed > gone.
+        A departed bus does not beat an approaching bus.
+        """
         best = {}
         for bus in active_buses.values():
             d = bus.direction
@@ -974,7 +1009,8 @@ def main():
     log.info("Entering main loop — mode: %s", mode)
 
     while True:
-        now          = time.time()
+        loop_start   = time.time()
+        now          = loop_start
         current_mode = mode
         gtfs.ensure_loaded()
 
@@ -1018,18 +1054,26 @@ def main():
 
                     remaining = [stu.stop_id for stu in tu.stop_time_update]
 
-                    # Determine direction by which stop this trip serves.
-                    # Try Direction A stop first, then Direction B.
                     raw_sa_a = gtfs.stops_away(trip_id, cfg["stop_id_a"], remaining)
                     raw_sa_b = gtfs.stops_away(trip_id, cfg["stop_id_b"], remaining)
 
                     if raw_sa_a is None and raw_sa_b is None:
-                        continue  # trip doesn't serve either stop
+                        continue
 
-                    # If trip serves both stops (loop route), use the one
-                    # the bus is currently heading toward (lower stops_away)
+                    # For trips serving both stops (loop routes), prefer the stop
+                    # the bus is currently heading toward. Use GTFS direction_id as
+                    # a tiebreaker when stops_away values are equal or both departed.
+                    gtfs_direction_id = trip_info.get("direction_id", "0")
                     if raw_sa_a is not None and raw_sa_b is not None:
-                        if raw_sa_a <= raw_sa_b:
+                        # Lower stops_away = closer / more relevant
+                        # For equal values (e.g. both -1 departed), use GTFS direction_id:
+                        # direction_id "0" → Direction A, "1" → Direction B
+                        if raw_sa_a == raw_sa_b:
+                            if gtfs_direction_id == "0":
+                                direction, raw_sa = "A", raw_sa_a
+                            else:
+                                direction, raw_sa = "B", raw_sa_b
+                        elif raw_sa_a <= raw_sa_b:
                             direction, raw_sa = "A", raw_sa_a
                         else:
                             direction, raw_sa = "B", raw_sa_b
@@ -1046,12 +1090,13 @@ def main():
                         if current_mode == MODE_COASTING:
                             continue
                         active_buses[trip_id] = BusState(
-                            trip_id   = trip_id,
-                            route_id  = route_id,
-                            direction = direction,
-                            headsign  = trip_info.get("headsign", ""),
-                            color     = route_color(route_id),
-                            stop_id   = stop_id,
+                            trip_id      = trip_id,
+                            route_id     = route_id,
+                            direction    = direction,
+                            direction_id = gtfs_direction_id,
+                            headsign     = trip_info.get("headsign", ""),
+                            color        = route_color(route_id),
+                            stop_id      = stop_id,
                         )
 
                     bus          = active_buses[trip_id]
@@ -1106,7 +1151,8 @@ def main():
                     if pos.latitude and pos.longitude:
                         active_buses[trip_id].update_gps(
                             pos.latitude, pos.longitude,
-                            vp.timestamp or now,
+                            # Use a fresh timestamp — not the stale loop-start `now`
+                            vp.timestamp if vp.timestamp else time.time(),
                         )
             except Exception as e:
                 log.error("Vehicle position error: %s", e)
@@ -1138,11 +1184,16 @@ def main():
             time.sleep(0.5)
             continue
 
-        pulse_phase     += cfg["pulse_speed"] * 0.05
+        # Advance pulse phase using actual elapsed time so the animation
+        # runs at a consistent speed regardless of how long API calls took
+        now_render   = time.time()
+        dt_pulse     = now_render - last_pulse_time
+        last_pulse_time = now_render
+        pulse_phase += cfg["pulse_speed"] * dt_pulse
         pulse_brightness = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(2 * math.pi * pulse_phase))
 
         renderer.tick()
-        buses = list(active_buses.values())
+        buses      = list(active_buses.values())
         is_pulsing = any(b.state == "at_stop" for b in buses)
 
         for inst in instances:

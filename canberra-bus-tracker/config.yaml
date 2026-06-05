@@ -1,12 +1,11 @@
 name: "Canberra Bus Tracker"
 description: "Tracks Transport Canberra buses approaching a stop and displays proximity on WLED LEDs with MQTT HA integration"
-version: "0.3.15"
+version: "0.3.16"
 slug: "canberra_bus_tracker"
 init: false
 arch:
   - aarch64
   - amd64
-
 options:
   api_key: ""
   api_base_url: "https://transport.api.act.gov.au/gtfs/data/gtfs/v2"
@@ -20,15 +19,16 @@ options:
   arrival_offset_seconds: 90
   departed_timeout_seconds: 60
   flash_interval_ms: 500
-  color_at_stop: "#FFFFFF"
-  color_departed: "#FF0000"
-  color_default: "#0078FF"
+  color_at_stop:  [255, 255, 255]
+  color_departed: [255,   0,   0]
+  color_default:  [0,   120, 255]
+  color_off:      [0,     0,   0]
   pulse_speed: 1.5
   route_colors:
     - route: "1"
-      color: "#FF1493"
+      color: [255, 20, 147]
     - route: "2"
-      color: "#FFA000"
+      color: [255, 160, 0]
   # WLED instances — add one entry per physical WLED device
   # label becomes the HA entity name and MQTT topic slug
   wled_instances:
@@ -45,7 +45,6 @@ options:
   mqtt_password: ""
   mqtt_topic_prefix: "bus_stop"
   debug: false
-
 schema:
   api_key: "str"
   api_base_url: "str"
@@ -59,13 +58,31 @@ schema:
   arrival_offset_seconds: "int(0,3600)"
   departed_timeout_seconds: "int(10,600)"
   flash_interval_ms: "int(100,2000)"
-  color_at_stop: "str"
-  color_departed: "str"
-  color_default: "str"
+  # Colours accept either a 3-element decimal list [R, G, B] or a hex string "#RRGGBB".
+  # The HA config UI only supports decimal lists; hex strings work via options.json directly.
+  color_at_stop:
+    - "int(0,255)"
+    - "int(0,255)"
+    - "int(0,255)"
+  color_departed:
+    - "int(0,255)"
+    - "int(0,255)"
+    - "int(0,255)"
+  color_default:
+    - "int(0,255)"
+    - "int(0,255)"
+    - "int(0,255)"
+  color_off:
+    - "int(0,255)"
+    - "int(0,255)"
+    - "int(0,255)"
   pulse_speed: "float(0.1,5.0)"
   route_colors:
     - route: "str"
-      color: "str"
+      color:
+        - "int(0,255)"
+        - "int(0,255)"
+        - "int(0,255)"
   wled_instances:
     - ip: "str?"
       led_offset: "int(0,1000)"
