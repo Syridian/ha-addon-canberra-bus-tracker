@@ -8,7 +8,7 @@ This repository contains the **Canberra Bus Tracker** Home Assistant addon.
 2. Click **⋮ (three dots)** in the top right → **Repositories**
 3. Add this repository URL:
    ```
-   https://github.com/YOUR_USERNAME/ha-addon-canberra-bus-tracker
+   https://github.com/Syridian/ha-addon-canberra-bus-tracker
    ```
 4. Click **Add**, then close the dialog
 5. **Canberra Bus Tracker** will appear in the addon store — click it and install
