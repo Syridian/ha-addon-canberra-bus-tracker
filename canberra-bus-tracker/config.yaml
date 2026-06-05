@@ -1,0 +1,86 @@
+name: "Canberra Bus Tracker"
+description: "Tracks Transport Canberra buses approaching a stop and displays proximity on WLED LEDs with MQTT HA integration"
+version: "0.3.15"
+slug: "canberra_bus_tracker"
+init: false
+arch:
+  - aarch64
+  - amd64
+
+options:
+  api_key: ""
+  api_base_url: "https://transport.api.act.gov.au/gtfs/data/gtfs/v2"
+  gtfs_static_url: "https://www.transport.act.gov.au/googletransit/google_transit.zip"
+  stop_id_a: ""
+  stop_id_b: ""
+  route_filter: ""
+  poll_interval: 15
+  gps_poll_interval: 15
+  gtfs_refresh_hours: 24
+  arrival_offset_seconds: 90
+  departed_timeout_seconds: 60
+  flash_interval_ms: 500
+  color_at_stop:  [255, 255, 255]
+  color_departed: [255,   0,   0]
+  color_default:  [0,   120, 255]
+  pulse_speed: 1.5
+  route_colors:
+    - route: "5"
+      color: [255, 20, 147]
+    - route: "76"
+      color: [255, 160, 0]
+  # WLED instances — add one entry per physical WLED device
+  # label becomes the HA entity name and MQTT topic slug
+  wled_instances:
+    - ip: ""
+      led_offset: 0
+      num_leds: 5
+      brightness: 100
+      segment_id: 9
+      label: "WLED 1"
+  mqtt_enabled: false
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  mqtt_topic_prefix: "bus_stop"
+  debug: false
+
+schema:
+  api_key: "str"
+  api_base_url: "str"
+  gtfs_static_url: "str"
+  stop_id_a: "str"
+  stop_id_b: "str"
+  route_filter: "str?"
+  poll_interval: "int(5,300)"
+  gps_poll_interval: "int(5,300)"
+  gtfs_refresh_hours: "int(1,168)"
+  arrival_offset_seconds: "int(0,3600)"
+  departed_timeout_seconds: "int(10,600)"
+  flash_interval_ms: "int(100,2000)"
+  color_at_stop:
+    - "int(0,255)"
+  color_departed:
+    - "int(0,255)"
+  color_default:
+    - "int(0,255)"
+  pulse_speed: "float(0.1,5.0)"
+  route_colors:
+    - route: "str"
+      color:
+        - "int(0,255)"
+  wled_instances:
+    - ip: "str?"
+      led_offset: "int(0,1000)"
+      num_leds: "int(5,100)"
+      brightness: "int(0,100)"
+      segment_id: "int(0,31)"
+      label: "str"
+  mqtt_enabled: "bool"
+  mqtt_host: "str"
+  mqtt_port: "int(1,65535)"
+  mqtt_user: "str?"
+  mqtt_password: "str?"
+  mqtt_topic_prefix: "str"
+  debug: "bool"
