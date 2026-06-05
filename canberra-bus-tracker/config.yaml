@@ -20,15 +20,13 @@ options:
   arrival_offset_seconds: 90
   departed_timeout_seconds: 60
   flash_interval_ms: 500
-  color_at_stop:  [255, 255, 255]
-  color_departed: [255,   0,   0]
-  color_default:  [0,   120, 255]
+  color_at_stop: "#FFFFFF"
+  color_departed: "#FF0000"
+  color_default: "#0078FF"
   pulse_speed: 1.5
   route_colors:
-    - route: "1"
-      color: [255, 20, 147]
-    - route: "2"
-      color: [255, 160, 0]
+      color: "#FF1493"
+      color: "#FFA000"
   # WLED instances — add one entry per physical WLED device
   # label becomes the HA entity name and MQTT topic slug
   wled_instances:
@@ -59,17 +57,13 @@ schema:
   arrival_offset_seconds: "int(0,3600)"
   departed_timeout_seconds: "int(10,600)"
   flash_interval_ms: "int(100,2000)"
-  color_at_stop:
-    - "int(0,255)"
-  color_departed:
-    - "int(0,255)"
-  color_default:
-    - "int(0,255)"
+  color_at_stop: "str"
+  color_departed: "str"
+  color_default: "str"
   pulse_speed: "float(0.1,5.0)"
   route_colors:
     - route: "str"
-      color:
-        - "int(0,255)"
+      color: "str"
   wled_instances:
     - ip: "str?"
       led_offset: "int(0,1000)"

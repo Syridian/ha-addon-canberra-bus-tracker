@@ -297,13 +297,13 @@ def load_config() -> dict:
         ))
 
     # route_colors can be either:
-    # - list format (from HA config UI): [{"route": "5", "color": [255,20,147]}, ...]
-    # - dict format (from options.json or standalone): {"5": [255,20,147], ...}
+    # - list format (from HA config UI): [{"route": "5", "color": "#FF1493"}, ...]
+    # - dict format (from options.json or standalone): {"5": "#FF1493", ...}
     raw_colors = cfg.get("route_colors", [])
     if isinstance(raw_colors, list):
-        route_colors = {item["route"]: item["color"] for item in raw_colors if "route" in item}
+        route_colors = {item["route"]: hex_to_rgb(item["color"]) for item in raw_colors if "route" in item}
     else:
-        route_colors = raw_colors
+        route_colors = {k: hex_to_rgb(v) for k, v in raw_colors.items()}
 
     return {
         "api_key":                  get("api_key", "Transport Canberra API key", secret=True),
@@ -319,11 +319,11 @@ def load_config() -> dict:
         "departed_timeout_seconds": int(cfg.get("departed_timeout_seconds", 60)),
         "wled_instances":           wled_instances,
         "flash_interval_ms":        int(cfg.get("flash_interval_ms", 500)),
-        "color_at_stop":            cfg.get("color_at_stop",  [255, 255, 255]),
-        "color_departed":           cfg.get("color_departed", [255,   0,   0]),
-        "color_off":                cfg.get("color_off",      [  0,   0,   0]),
+        "color_at_stop":            hex_to_rgb(cfg.get("color_at_stop",  "#FFFFFF")),
+        "color_departed":           hex_to_rgb(cfg.get("color_departed", "#FF0000")),
+        "color_off":                hex_to_rgb(cfg.get("color_off",      "#000000")),
         "route_colors":             route_colors,
-        "color_default":            cfg.get("color_default", [0, 120, 255]),
+        "color_default":            hex_to_rgb(cfg.get("color_default",  "#0078FF")),
         "pulse_speed":              float(cfg.get("pulse_speed", 1.5)),
         "mqtt_enabled":             bool(cfg.get("mqtt_enabled", False)),
         "mqtt_host":                cfg.get("mqtt_host", "core-mosquitto"),
@@ -357,6 +357,24 @@ def segment_fraction(bus_lat, bus_lon, from_lat, from_lon, to_lat, to_lon) -> fl
     if seg_len_sq == 0:
         return 0.0
     return max(0.0, min(1.0, (bx * dx + by * dy) / seg_len_sq))
+
+
+def hex_to_rgb(value) -> list:
+    """
+    Convert a colour value to [R, G, B].
+    Accepts:
+      - Hex string: "#FF1493" or "FF1493" (with or without #)
+      - RGB list:   [255, 20, 147]  (legacy/standalone format)
+    Falls back to white [255,255,255] on any parse error.
+    """
+    if isinstance(value, (list, tuple)):
+        return [max(0, min(255, int(v))) for v in value[:3]]
+    try:
+        h = str(value).strip().lstrip("#")
+        return [int(h[i:i+2], 16) for i in (0, 2, 4)]
+    except Exception:
+        log.warning("Invalid colour value '%s' — using white", value)
+        return [255, 255, 255]
 
 
 # ── GTFS Static ───────────────────────────────────────────────────────────────
